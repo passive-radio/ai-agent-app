@@ -1,0 +1,123 @@
+services:
+  server:
+    build:
+      context: ./src/containers/server
+      dockerfile: Dockerfile
+    ports:
+      - "3001:3001"
+    environment:
+      - NODE_ENV=production
+      - PORT=3001
+      - HOST=0.0.0.0
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - DATABASE_URL=mongodb://mongo:27017/ai-agent-chat
+    depends_on:
+      - mongo
+      - time
+      - web-search
+      - calculator
+      # - fetch
+      - playwright
+    volumes:
+      - ./src/common:/app/src/common
+      - ./.env:/app/.env
+      - ./src/containers/server/data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - ai-agent-network
+    restart: unless-stopped
+
+  web-ui:
+    build:
+      context: ./src/containers/web-ui
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+      - "8081:8081"
+    environment:
+      - NODE_ENV=production
+      - REACT_APP_API_URL=http://localhost:3001
+    volumes:
+      - ./src/common:/app/src/common
+    depends_on:
+      - server
+    networks:
+      - ai-agent-network
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:latest
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - ai-agent-network
+    restart: unless-stopped
+    
+  # Tool services for the ReAct agent
+  time:
+    image: passiveradio/http-mcp-time-server:v0.0.1
+    environment:
+      - PORT=3002
+    ports:
+      - "3002:3000"
+    networks:
+      - ai-agent-network
+    restart: unless-stopped
+    tty: true
+    
+  web-search:
+    image: passiveradio/http-mcp-web-search-server:v0.0.1
+    environment:
+      - PORT=3003
+    ports:
+      - "3003:3000"
+    env_file:
+      - .env
+    networks:
+      - ai-agent-network
+    restart: unless-stopped
+    tty: true
+    
+  # fetch:
+  #   image: passiveradio/http-mcp-fetch-server:latest
+  #   environment:
+  #     - PORT=3004
+  #   ports:
+  #     - "3004:3000"
+  #   networks:
+  #     - ai-agent-network
+  #   restart: unless-stopped
+  #   tty: true
+
+  calculator:
+    image: passiveradio/http-mcp-simple-math-server:v0.0.1
+    environment:
+      - PORT=3005
+    ports:
+      - "3005:3000"
+    networks:
+      - ai-agent-network
+    restart: unless-stopped
+    tty: true
+
+  playwright:
+    image: mcr.microsoft.com/playwright:latest
+    command: ["npx", "-y", "@playwright/mcp", "--port", "3006", "--host", "0.0.0.0", "--headless", "--browser", "chromium"]
+    environment:
+      - PORT=3006
+    ports:
+      - "3006:3000"
+    networks:
+      - ai-agent-network
+    restart: unless-stopped
+    tty: true
+      
+
+networks:
+  ai-agent-network:
+    driver: bridge
+
+volumes:
+  mongo-data:

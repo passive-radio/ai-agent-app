@@ -1,0 +1,145 @@
+// The configuration file format is [JSON5](https://json5.org/),
+// where comments and trailing commas are allowed.
+// The file format is further extended to replace `${...}` notations
+// with the values of corresponding environment variables.
+// Keep all the credentials and private into the `.env` file
+// and refer to them with `${...}` notation as needed.
+{
+  "default_llm": "openai/gpt-4.1-nano",
+  "llms": [
+    {
+    id: 'openai/gpt-4.1-nano',
+    name: 'GPT-4.1 Nano',
+    provider: 'OpenAI',
+    description: 'OpenAIのGPTシリーズで最も低遅延、低コストのモデル。低レイテンシーが要求されるアプリケーションに最適。',
+    enabledToolCalls: true,
+    },
+    {
+    id: 'meta-llama/llama-4-maverick:free',
+    name: 'Llama 4 Maverick (Free)',
+    provider: 'Meta',
+    description: 'Metaの最新のモデル。高度な自然言語理解と推論能力を持つ',
+    enabledToolCalls: false,
+    },
+    {
+    id: 'deepseek/deepseek-chat-v3-0324:free',
+    name: 'DeepSeek Chat v3.0324 (Free)',
+    provider: 'DeepSeek',
+    description: 'DeepSeekの最新のモデル。高度な自然言語理解と推論能力を持つ',
+    enabledToolCalls: false,
+    },
+    {
+    id: 'openai/gpt-4.1',
+    name: 'GPT-4.1',
+    provider: 'OpenAI',
+    description: 'OpenAIの比較的新しいモデル。高度な自然言語理解と推論能力を持つ',
+    enabledToolCalls: true,
+    },
+    {
+    id: 'openai/o3-mini-high',
+    name: 'gpt-o3-mini-high',
+    provider: 'OpenAI',
+    description: 'OpenAI o3-mini-high is the same model as o3-mini with reasoning_effort set to high. o3-mini is a cost-efficient language model optimized for STEM reasoning tasks, particularly excelling in science, mathematics, and coding.',
+    enabledToolCalls: true,
+    },
+    {
+    id: 'google/gemini-2.5-flash-preview',
+    name: 'Gemini 2.5 Flash',
+    provider: 'Google',
+    description: 'Googleの最新のモデル。高度な自然言語理解と推論能力を持つ',
+    enabledToolCalls: true,
+    },
+    {
+    id: 'google/gemini-2.0-flash-001',
+    name: 'Google Gemini 2.0 Flash',
+    provider: 'Google',
+    description: 'Googleの高性能モデル。複雑な理解と会話に優れる',
+    enabledToolCalls: true,
+    },
+    {
+    id: 'anthropic/claude-3.7-sonnet',
+    name: 'Anthropic Claude 3.7 Sonnet',
+    provider: 'Anthropic',
+    description: 'Anthropicの高性能モデル。特にコーディングに優れる',
+    enabledToolCalls: true,
+    },
+  ]
+    "example_queries": [
+        "Tomorrow's weather in SF?",
+        "Read and briefly summarize the LICENSE file",
+        "Read the news headlines on bbc.com",
+    ],
+    "mcp_servers": {
+        // https://github.com/modelcontextprotocol/servers/tree/main/src/filesystem
+        "filesystem": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-filesystem@latest",
+                "/home/passiveradio/dev/personal/ai-agents/mcp-client-langchain-ts/",
+            ]
+        },
+        "time": {
+            "command": "docker",
+            "args": [
+                "run",
+                "-i",
+                "--rm",
+                "mcp/time"
+            ]
+        },
+        // https://github.com/modelcontextprotocol/servers/tree/main/src/fetch
+        "fetch": {
+            "command": "uvx",
+            "args": [
+                "mcp-server-fetch"
+            ]
+        },
+        "sequentialthinking": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-sequential-thinking"
+            ]
+        },
+        // https://github.com/modelcontextprotocol/quickstart-resources/tree/main/weather-server-python
+        "weather": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@h1deya/mcp-server-weather@latest"
+            ]
+        },
+        // https://github.com/microsoft/playwright-mcp
+        "playwright": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@playwright/mcp@latest",
+                "--headless"
+            ]
+        },
+        // https://github.com/modelcontextprotocol/servers/tree/main/src/brave-search
+        "brave-search": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-brave-search@latest"
+            ],
+            "env": {
+                "BRAVE_API_KEY": "${BRAVE_API_KEY}"
+            }
+        },
+        "google-calendar": {
+            "command": "node",
+            "args": ["/home/passiveradio/dev/personal/ai-agents/mcps/google-calendar-mcp/build/index.js"]
+        },
+        "memory": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "@modelcontextprotocol/server-memory"
+            ]
+        }
+    }
+}
