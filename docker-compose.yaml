@@ -59,7 +59,7 @@ services:
   time:
     image: passiveradio/http-mcp-time-server:v0.0.1
     environment:
-      - PORT=3002
+      - PORT=3000
     ports:
       - "3002:3000"
     networks:
@@ -70,7 +70,7 @@ services:
   web-search:
     image: passiveradio/http-mcp-web-search-server:v0.0.1
     environment:
-      - PORT=3003
+      - PORT=3000
     ports:
       - "3003:3000"
     env_file:
@@ -94,7 +94,7 @@ services:
   calculator:
     image: passiveradio/http-mcp-simple-math-server:v0.0.1
     environment:
-      - PORT=3005
+      - PORT=3000
     ports:
       - "3005:3000"
     networks:
@@ -104,9 +104,9 @@ services:
 
   playwright:
     image: mcr.microsoft.com/playwright:latest
-    command: ["npx", "-y", "@playwright/mcp", "--port", "3006", "--host", "0.0.0.0", "--headless", "--browser", "chromium"]
+    command: ["npx", "-y", "@playwright/mcp", "--port", "3000", "--host", "0.0.0.0", "--headless", "--browser", "chromium"]
     environment:
-      - PORT=3006
+      - PORT=3000
     ports:
       - "3006:3000"
     networks:

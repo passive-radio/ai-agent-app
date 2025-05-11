@@ -1,5 +1,6 @@
 /**
  * Chat controller for handling chat requests and responses
+ * Version 2 - Using StreamableHTTP MCP Transport
  */
 import { FastifyReply } from "fastify";
 import { v4 as uuidv4 } from "uuid";
@@ -11,101 +12,477 @@ import config from "../config";
 import { HumanMessage } from "@langchain/core/messages";
 import { createReactAgent } from "@langchain/langgraph/prebuilt";
 import { GraphRecursionError } from "@langchain/langgraph";
-import { MultiServerMCPClient } from "@langchain/mcp-adapters";
-import { StructuredToolInterface } from "@langchain/core/tools";
+import { tool } from "@langchain/core/tools";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { z } from "zod";
+
+// Interface representing an MCP Tool Server Configuration
+interface MCPToolServerConfig {
+  url: string;
+  reconnect: {
+    enabled: boolean;
+    maxAttempts: number;
+    delayMs: number;
+  };
+}
+
+// Interface representing MCP tool server connections
+interface MCPServerConnections {
+  [serverName: string]: {
+    client: Client;
+    transport: StreamableHTTPClientTransport;
+    connected: boolean;
+  };
+}
 
 export class ChatController {
   private sessionService: SessionService;
   private modelService: ModelService;
-  private mcpClient: MultiServerMCPClient;
+  private mcpServers: Record<string, MCPToolServerConfig>;
+  private mcpConnections: MCPServerConnections;
 
   constructor() {
     this.sessionService = new SessionService();
     this.modelService = new ModelService();
+    this.mcpConnections = {};
 
-    // Initialize the MCP client with our services
-    this.mcpClient = new MultiServerMCPClient({
-      // Global configuration
-      throwOnLoadError: false, // Don't throw on errors, just log them
-      prefixToolNameWithServerName: true, // Prefix tool names with server names
-      additionalToolNamePrefix: "mcp", // Add 'mcp' prefix to all tools
-
-      // Server configuration - using SSE transport since we have HTTP servers
-      mcpServers: {
-        time: {
-          transport: "sse",
-          url: "http://time:3000", // コンテナ名:内部ポート（Docker内部通信）
-          reconnect: {
-            enabled: true,
-            maxAttempts: 2, // 試行回数を増やす
-            delayMs: 2000, // 再試行の間隔を長くする
-          },
-        },
-        "web-search": {
-          transport: "sse",
-          url: "http://web-search:3000", // コンテナ名:内部ポート（Docker内部通信）
-          reconnect: {
-            enabled: true,
-            maxAttempts: 3,
-            delayMs: 2000,
-          },
-        },
-        // fetch: {
-        //   transport: "sse",
-        //   url: "http://fetch:3000", // コンテナ名:内部ポート（Docker内部通信）
-        //   reconnect: {
-        //     enabled: true,
-        //     maxAttempts: 2,
-        //     delayMs: 2000,
-        //   },
-        // },
-        calculator: {
-          transport: "sse",
-          url: "http://calculator:3000", // コンテナ名:内部ポート（Docker内部通信）
-          reconnect: {
-            enabled: true,
-            maxAttempts: 2,
-            delayMs: 2000,
-          },
-        },
-        playwright: {
-          transport: "sse",
-          url: "http://playwright:3000", // コンテナ名:内部ポート（Docker内部通信）
-          reconnect: {
-            enabled: true,
-            maxAttempts: 3,
-            delayMs: 2000,
-          },
+    // Define MCP servers configuration
+    this.mcpServers = {
+      time: {
+        url: "http://time:3000/",
+        reconnect: {
+          enabled: true,
+          maxAttempts: 2,
+          delayMs: 2000,
         },
       },
-    });
+      "web-search": {
+        url: "http://web-search:3000/",
+        reconnect: {
+          enabled: true,
+          maxAttempts: 3,
+          delayMs: 2000,
+        },
+      },
+      calculator: {
+        url: "http://calculator:3000/",
+        reconnect: {
+          enabled: true,
+          maxAttempts: 2,
+          delayMs: 2000,
+        },
+      },
+      playwright: {
+        url: "http://playwright:3000/mcp",
+        reconnect: {
+          enabled: true,
+          maxAttempts: 3,
+          delayMs: 2000,
+        },
+      },
+    };
 
-    // Initialize the MCP client (no need to call explicit connect method)
     console.log(
-      "MCP client initialized, will connect automatically when getTools is called"
+      "MCP configuration initialized, connections will be established when needed"
     );
   }
 
   /**
-   * Initialize the MCP client and get tools
+   * Initialize MCP connections and load tools
    */
-  private async getMCPTools(): Promise<StructuredToolInterface[]> {
+  private async connectToMCPServer(
+    serverName: string,
+    config: MCPToolServerConfig
+  ): Promise<Client | null> {
     try {
-      // Get tools from all MCP servers (this will connect automatically)
+      console.log(`Connecting to MCP server "${serverName}" at ${config.url}`);
+
+      // Create transport
+      const transport = new StreamableHTTPClientTransport(new URL(config.url), {
+        sessionId: undefined, // Let the server generate one
+      });
+
+      // Create client
+      const client = new Client({
+        name: `ai-agent-chat-client-${serverName}`,
+        version: "0.0.1",
+      });
+
+      // Set up error handler
+      client.onerror = (error) => {
+        console.error(`MCP client error for "${serverName}":`, error);
+      };
+
+      // Connect to the server
+      await client.connect(transport);
+
+      // Store the connection
+      this.mcpConnections[serverName] = {
+        client,
+        transport,
+        connected: true,
+      };
+
+      console.log(`Successfully connected to MCP server "${serverName}"`);
+      return client;
+    } catch (error) {
+      console.error(`Failed to connect to MCP server "${serverName}":`, error);
+      return null;
+    }
+  }
+
+  /**
+   * Get tools from all configured MCP servers
+   */
+  private async getMCPTools(): Promise<any[]> {
+    const tools: any[] = [];
+    const connectedServers: string[] = [];
+
+    try {
       console.log("Attempting to connect to MCP tool servers...");
 
-      try {
-        // Get tools from all MCP servers (this will connect automatically)
-        const mcpTools = await this.mcpClient.getTools();
-        console.log(`Successfully loaded ${mcpTools.length} MCP tools`);
-        return mcpTools;
-      } catch (error) {
-        console.error("Error getting MCP tools:", error);
-        return [];
-      }
+      // Connect to each server and get tools
+      const connectionPromises = Object.entries(this.mcpServers).map(
+        async ([serverName, config]) => {
+          // Connect if not already connected
+          if (
+            !this.mcpConnections[serverName] ||
+            !this.mcpConnections[serverName].connected
+          ) {
+            const client = await this.connectToMCPServer(serverName, config);
+            if (!client) return;
+          }
+
+          const connection = this.mcpConnections[serverName];
+          if (!connection || !connection.connected) return;
+
+          try {
+            // Get tools metadata from the server
+            const toolsMetadata = await connection.client.listTools();
+
+            console.log("----------------------------------------------");
+            console.log("toolsMetadata", toolsMetadata);
+            console.log("toolsMetadata.length", toolsMetadata.length);
+            console.log("toolsMetadata[0]", toolsMetadata[0]);
+            console.log("----------------------------------------------");
+
+            // Convert MCP tools to LangChain tools
+            if (
+              toolsMetadata &&
+              toolsMetadata.tools &&
+              Array.isArray(toolsMetadata.tools)
+            ) {
+              for (const toolMetadata of toolsMetadata.tools) {
+                // Format tool name to be more user-friendly for LLM
+                const toolName = toolMetadata.name.replace(/-/g, "_");
+                const formattedName = `${serverName}_${toolName}`;
+
+                // [todo] Use the inputSchema, annotations, and description to create and call tool properly
+                const inputSchema = toolMetadata.inputSchema;
+                const annotations = toolMetadata.annotations;
+                const description = toolMetadata.description;
+
+                // Create dynamic tool description based on metadata
+                let toolDescription =
+                  description || `Tool from ${serverName} server`;
+
+                // Add information about server and expected input format
+                toolDescription += `\n\nThis is a tool from the ${serverName} server.`;
+
+                // Add parameter details from inputSchema if available
+                if (
+                  inputSchema &&
+                  inputSchema.type === "object" &&
+                  inputSchema.properties
+                ) {
+                  const paramDetails = Object.entries(inputSchema.properties)
+                    .map(([paramName, paramProps]: [string, any]) => {
+                      let paramDesc = `- ${paramName}: ${
+                        paramProps.description || "Parameter"
+                      }`;
+                      if (paramProps.enum) {
+                        paramDesc += ` (Valid values: ${paramProps.enum.join(
+                          ", "
+                        )})`;
+                      }
+                      if (paramProps.type) {
+                        paramDesc += ` (Type: ${paramProps.type})`;
+                      }
+                      return paramDesc;
+                    })
+                    .join("\n");
+
+                  toolDescription += `\n\nParameters:\n${paramDetails}`;
+                } else {
+                  // Add generic parameter info based on server type
+                  if (
+                    serverName === "time" &&
+                    toolMetadata.name === "current-time"
+                  ) {
+                    toolDescription += `\nTo use this tool, provide a timezone name like 'Asia/Tokyo', 'America/New_York', or 'UTC' to get the current time in that timezone.`;
+                  } else if (serverName === "calculator") {
+                    toolDescription += `\nTo use this calculator, provide a mathematical expression like '2+2', '(3*4)/2', etc.`;
+                  } else if (serverName === "web-search") {
+                    toolDescription += `\nTo use this web search tool, provide a search query.`;
+                  } else {
+                    toolDescription += `\nTo use this tool, provide input as a simple string.`;
+                  }
+                }
+
+                // Add examples if available in annotations
+                if (
+                  annotations &&
+                  annotations.examples &&
+                  Array.isArray(annotations.examples)
+                ) {
+                  toolDescription += "\n\nExamples:";
+                  annotations.examples.forEach(
+                    (example: any, index: number) => {
+                      if (example.input && example.output) {
+                        toolDescription += `\n${index + 1}. Input: "${
+                          example.input
+                        }" → Output: "${example.output}"`;
+                      }
+                    }
+                  );
+                }
+
+                // Using detailed schema information for the tool
+                const mcpTool = tool(
+                  async (input: { input: string }) => {
+                    try {
+                      // Log the call attempt
+                      console.log(
+                        `Making MCP tool call to server: ${serverName}, tool: ${toolMetadata.name}`
+                      );
+
+                      // Format the input based on MCP protocol and inputSchema requirements
+                      let params: any;
+
+                      // Parse LLM-provided arguments if they are complex
+                      try {
+                        // Check if the input.input is actually a JSON string with multiple parameters
+                        const parsedInput = JSON.parse(input.input);
+
+                        if (
+                          typeof parsedInput === "object" &&
+                          parsedInput !== null
+                        ) {
+                          console.log("Parsed complex input:", parsedInput);
+                          params = parsedInput;
+                        } else {
+                          params = { input: input.input };
+                        }
+                      } catch (e) {
+                        // Not JSON, use normal handling
+                        // Check if any additional arguments were provided by the LLM
+                        const anyInput = input as any;
+                        if (
+                          anyInput.args &&
+                          typeof anyInput.args === "object"
+                        ) {
+                          console.log(
+                            "Using args object directly:",
+                            anyInput.args
+                          );
+                          params = anyInput.args;
+                        } else if (
+                          inputSchema &&
+                          inputSchema.type === "object" &&
+                          inputSchema.properties
+                        ) {
+                          // Extract parameter info from schema
+                          const paramNames = Object.keys(
+                            inputSchema.properties
+                          );
+                          if (paramNames.length > 0) {
+                            // For web-search, use 'query' as the primary parameter
+                            if (
+                              serverName === "web-search" &&
+                              paramNames.includes("query")
+                            ) {
+                              params = { query: input.input };
+
+                              // Add default values for other parameters
+                              if (
+                                inputSchema.properties &&
+                                "count" in inputSchema.properties
+                              ) {
+                                params.count = 5; // Default count
+                              }
+                            } else {
+                              const primaryParamName = paramNames[0];
+                              params = { [primaryParamName]: input.input };
+                            }
+                            console.log(
+                              `Using schema-defined parameter: ${
+                                Object.keys(params)[0]
+                              }`
+                            );
+                          } else {
+                            params = { input: input.input };
+                          }
+                        } else {
+                          // Fall back to standard parameter names based on server type
+                          if (
+                            serverName === "time" &&
+                            toolMetadata.name === "current-time"
+                          ) {
+                            params = { timezone: input.input };
+                          } else if (
+                            serverName === "web-search" &&
+                            toolMetadata.name === "brave_search"
+                          ) {
+                            params = { query: input.input };
+                          } else {
+                            params = { input: input.input };
+                          }
+                        }
+                      }
+
+                      // Handle special type conversions based on inputSchema
+                      if (inputSchema && inputSchema.properties) {
+                        Object.entries(params).forEach(([key, value]) => {
+                          const propSchema =
+                            inputSchema.properties &&
+                            (inputSchema.properties[key] as any);
+                          if (propSchema) {
+                            // Convert string to number if schema expects a number
+                            if (
+                              propSchema.type === "number" ||
+                              propSchema.type === "integer"
+                            ) {
+                              if (typeof value === "string") {
+                                const num = Number(value);
+                                if (!isNaN(num)) {
+                                  params[key] = num;
+                                }
+                              }
+                            }
+                          }
+                        });
+                      }
+
+                      console.log(`Calling tool with params:`, params);
+
+                      // Prepare tool call with proper format for SDK 0.14+
+                      const toolCall = {
+                        name: toolMetadata.name,
+                        arguments: params,
+                      };
+
+                      // The complete JSON-RPC request format (for reference)
+                      const jsonRpcFormat = {
+                        jsonrpc: "2.0",
+                        method: "tools/call",
+                        params: toolCall,
+                        id: Math.floor(Math.random() * 1000000).toString(),
+                      };
+
+                      console.log(
+                        `JSON-RPC request format:`,
+                        JSON.stringify(jsonRpcFormat, null, 2)
+                      );
+                      console.log(`Final tool call format:`, toolCall);
+
+                      // Call the MCP tool with the correct object format (not string)
+                      // @ts-ignore - Bypass TypeScript type checking for MCP client
+                      const result = await (connection.client as any).callTool(
+                        toolCall
+                      );
+
+                      return typeof result === "string"
+                        ? result
+                        : JSON.stringify(result);
+                    } catch (error) {
+                      console.error(
+                        `Error calling tool ${toolMetadata.name} on server ${serverName}:`,
+                        error
+                      );
+                      return `Error: ${error}`;
+                    }
+                  },
+                  {
+                    name: formattedName,
+                    description: toolDescription,
+                    schema: z.object({
+                      input: z.string().describe(
+                        inputSchema && inputSchema.properties
+                          ? Object.entries(inputSchema.properties)
+                              .map(
+                                ([name, prop]: [string, any]) =>
+                                  `${name}: ${prop.description || name}${
+                                    prop.enum
+                                      ? ` (possible values: ${prop.enum.join(
+                                          ", "
+                                        )})`
+                                      : ""
+                                  }`
+                              )
+                              .join(". ")
+                          : serverName === "time" &&
+                            toolMetadata.name === "current-time"
+                          ? `A timezone name like 'Asia/Tokyo', 'America/New_York', 'UTC', etc.`
+                          : serverName === "calculator"
+                          ? `A mathematical expression to calculate (e.g., '2+2', '3*4', 'sqrt(16)')`
+                          : serverName === "web-search"
+                          ? `A search query to look up information on the web`
+                          : `Input for ${toolMetadata.name}.`
+                      ),
+                    }),
+                  }
+                );
+
+                tools.push(mcpTool);
+              }
+            }
+
+            connectedServers.push(serverName);
+          } catch (error) {
+            console.error(
+              `Error getting tools from MCP server "${serverName}":`,
+              error
+            );
+          }
+        }
+      );
+
+      // Wait for all connection attempts to complete
+      await Promise.all(connectionPromises);
+
+      console.log(
+        `Successfully loaded ${
+          tools.length
+        } MCP tools from servers: ${connectedServers.join(", ")}`
+      );
+      return tools;
     } catch (error) {
       console.error("Error in getMCPTools:", error);
       return [];
+    }
+  }
+
+  /**
+   * Clean up MCP connections
+   */
+  private async closeMCPConnections(): Promise<void> {
+    for (const [serverName, connection] of Object.entries(
+      this.mcpConnections
+    )) {
+      if (connection.connected) {
+        try {
+          await connection.transport.close();
+          await connection.client.close();
+          connection.connected = false;
+          console.log(`Closed connection to MCP server "${serverName}"`);
+        } catch (error) {
+          console.error(
+            `Error closing connection to MCP server "${serverName}":`,
+            error
+          );
+        }
+      }
     }
   }
 
@@ -164,7 +541,7 @@ export class ChatController {
       });
 
       // Get MCP tools
-      let tools: StructuredToolInterface[] = [];
+      let tools: any[] = [];
       let agentGraph;
       let toolCallsEnabled = model.enabledToolCalls === true;
 
@@ -288,30 +665,8 @@ export class ChatController {
               chunk.agent.messages &&
               Array.isArray(chunk.agent.messages)
             ) {
-              // ReAct Agentのチャンクをより詳細にログ
-              console.log(
-                "Processing LangGraph agent chunk with messages:",
-                JSON.stringify(
-                  chunk.agent.messages.map((m) => ({
-                    type: m.type,
-                    hasContent: m.kwargs?.content ? true : false,
-                  }))
-                )
-              );
-
-              // ログして実際の構造を確認
-              console.log(
-                "First message raw structure:",
-                JSON.stringify(chunk.agent.messages[0])
-              );
-
-              // 受信データの形式を明確にログ出力
-              console.log(
-                "IMPORTANT: Analyzing agent chunk messages structure"
-              );
-
+              // Process LangGraph agent messages
               for (const msg of chunk.agent.messages) {
-                // メッセージ構造を詳細に分析
                 if (msg && msg.kwargs && msg.kwargs.content) {
                   // Append to full response
                   responseContent += msg.kwargs.content;
@@ -322,56 +677,15 @@ export class ChatController {
                     msg.kwargs.content,
                     responseMessageId
                   );
-                  console.log(
-                    "Found content in kwargs.content:",
-                    msg.kwargs.content
-                  );
                 } else if (msg && msg.lc === 1 && msg.kwargs?.content) {
-                  // 先ほどのログの例に合わせたケース
                   const content = msg.kwargs.content;
                   responseContent += content;
                   this.sendMessageEvent(reply, content, responseMessageId);
-                  console.log("Found content in LangChain format:", content);
                 } else if (msg && typeof msg.content === "string") {
-                  // 直接contentフィールドがある場合
                   responseContent += msg.content;
                   this.sendMessageEvent(reply, msg.content, responseMessageId);
-                  console.log("Found direct content field:", msg.content);
-                } else if (
-                  msg &&
-                  msg.constructor === Object &&
-                  Object.prototype.hasOwnProperty.call(msg, "content")
-                ) {
-                  // contentプロパティが直接存在する場合
-                  const content = String(msg.content);
-                  responseContent += content;
-                  this.sendMessageEvent(reply, content, responseMessageId);
-                  console.log("Found content property:", content);
-                } else {
-                  // 構造をさらに詳しくログに残して調査
-                  console.log(
-                    "Message structure for analysis:",
-                    JSON.stringify(msg)
-                  );
-                  // オブジェクトの場合はキーを確認
-                  if (msg && typeof msg === "object") {
-                    console.log("Available keys in message:", Object.keys(msg));
-                    // contentを含むキーを探す
-                    for (const key of Object.keys(msg)) {
-                      if (key.includes("content") && msg[key]) {
-                        const content = String(msg[key]);
-                        responseContent += content;
-                        this.sendMessageEvent(
-                          reply,
-                          content,
-                          responseMessageId
-                        );
-                        console.log(`Found content in '${key}':`, content);
-                        break;
-                      }
-                    }
-                  }
                 }
+
                 // Handle tool calls if present
                 if (
                   msg &&
@@ -391,11 +705,7 @@ export class ChatController {
             }
             // Handle additional LangGraph output formats
             else if (chunk.iterations !== undefined) {
-              console.log(
-                "Processing LangGraph iterations chunk:",
-                JSON.stringify(chunk)
-              );
-              // イテレーションチャンクから最終出力を探す
+              // Process LangGraph iterations
               if (chunk.iterations.length > 0) {
                 const lastIteration =
                   chunk.iterations[chunk.iterations.length - 1];
@@ -413,7 +723,7 @@ export class ChatController {
                     responseMessageId
                   );
                 }
-                // action_resultが含まれている場合も処理
+                // Handle tool action results
                 else if (lastIteration.action_result) {
                   const actionResult = lastIteration.action_result;
                   const resultContent =
@@ -426,7 +736,7 @@ export class ChatController {
                     `Tool result: ${resultContent}`
                   );
                 }
-                // actionが含まれている場合（ツール呼び出し）
+                // Handle tool actions
                 else if (lastIteration.action) {
                   const action = lastIteration.action;
                   this.sendThinkingEvent(
@@ -438,15 +748,12 @@ export class ChatController {
                 }
               }
             }
-            // 返答が steps として提供される場合
+            // Handle steps format
             else if (chunk.steps !== undefined && Array.isArray(chunk.steps)) {
-              console.log("Processing steps chunk:", JSON.stringify(chunk));
-
-              // 最後のステップから内容を抽出
+              // Process steps
               if (chunk.steps.length > 0) {
                 const lastStep = chunk.steps[chunk.steps.length - 1];
 
-                // 異なる形式のステップに対応
                 if (lastStep.output) {
                   const outputContent =
                     typeof lastStep.output === "string"
@@ -459,9 +766,7 @@ export class ChatController {
                     outputContent,
                     responseMessageId
                   );
-                }
-                // 最終的な結果がある場合
-                else if (lastStep.result) {
+                } else if (lastStep.result) {
                   const resultContent =
                     typeof lastStep.result === "string"
                       ? lastStep.result
@@ -476,12 +781,8 @@ export class ChatController {
                 }
               }
             }
-            // Handle direct output format from LangGraph
+            // Handle direct output format
             else if (chunk.output !== undefined) {
-              console.log(
-                "Processing direct output chunk:",
-                JSON.stringify(chunk)
-              );
               const outputContent =
                 typeof chunk.output === "string"
                   ? chunk.output
@@ -490,7 +791,7 @@ export class ChatController {
               responseContent += outputContent;
               this.sendMessageEvent(reply, outputContent, responseMessageId);
             }
-            // Handle regular message array chunks
+            // Handle message array chunks
             else if (
               chunk.messages &&
               Array.isArray(chunk.messages) &&
@@ -499,7 +800,7 @@ export class ChatController {
               const lastMessage = chunk.messages[chunk.messages.length - 1];
 
               if (lastMessage) {
-                // Handle tool usage (thinking events)
+                // Handle tool calls
                 if (lastMessage.tool_calls && lastMessage.tool_calls.length) {
                   const toolCall = lastMessage.tool_calls[0];
                   this.sendThinkingEvent(
@@ -530,27 +831,10 @@ export class ChatController {
                 }
               }
             }
-            // その他の形式のチャンク（未知の形式）をデバッグ
-            else {
-              console.log("Unknown chunk format:", Object.keys(chunk));
-              // 最後の手段として、chunk自体をJSONにして送信
-              if (Object.keys(chunk).length > 0) {
-                const fallbackContent = `\n\n[Debug] Received data: ${JSON.stringify(
-                  chunk,
-                  null,
-                  2
-                )}`;
-                this.sendThinkingEvent(reply, fallbackContent);
-              }
-            }
           }
         }
 
-        // Ensure the final assistant response is sent to the client at least
-        // once. In some edge-cases (e.g. when the streaming chunks do not
-        // contain a `content` field) the loop above might not have emitted any
-        // `message` events. Guard against that by emitting the accumulated
-        // `responseContent` right here if it has not been sent yet.
+        // Ensure the final assistant response is sent to the client at least once
         if (responseContent) {
           this.sendMessageEvent(reply, responseContent, responseMessageId);
         }
@@ -574,6 +858,9 @@ export class ChatController {
         } else {
           throw error;
         }
+      } finally {
+        // Close MCP connections when done
+        await this.closeMCPConnections();
       }
     } catch (error) {
       console.error("Error in streamChatResponse:", error);
@@ -625,8 +912,6 @@ export class ChatController {
     reply.raw.write(`data: {}\n\n`);
     // Ensure data is sent immediately
     this.flushReply(reply);
-    // Don't end the connection, keep it open for future messages
-    // reply.raw.end();
   }
 
   /**
@@ -638,8 +923,6 @@ export class ChatController {
     reply.raw.write(`data: {}\n\n`);
     // Ensure data is sent immediately
     this.flushReply(reply);
-    // Don't end the connection, keep it open for future messages
-    // reply.raw.end();
   }
 
   /**
@@ -649,7 +932,6 @@ export class ChatController {
   private flushReply(reply: FastifyReply): void {
     try {
       // NodeJSのHTTP.ServerResponseのflushHeaders()メソッドを使用
-      // TypeScriptの型定義を無視して実行
       const rawResponse = reply.raw as any;
       if (rawResponse.flush && typeof rawResponse.flush === "function") {
         rawResponse.flush();
